@@ -591,6 +591,7 @@ JOBS="${3:-2}"
 [[ -d "$KSRC" ]] || { echo "Missing headers: $KSRC" >&2; exit 1; }
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="$SCRIPT_DIR"
+GSP_C="$SRC_DIR/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c"
 cd "$SRC_DIR"
 config="$KSRC/.config"
 [[ -r "$config" ]] || config="/boot/config-$KVER"
@@ -695,6 +696,9 @@ install_dkms_modules() {
     else
         [[ "$(cat "$src/cmp90-upstream-ref" 2>/dev/null)" == "$GEN2_REF" ]] ||
             die "Зарегистрированный DKMS использует другой upstream; не подменяю исходники существующей версии"
+        # Refresh our wrapper when retrying a failed migration. NVIDIA sources
+        # and upstream compatibility code stay pinned and are not downloaded.
+        write_dkms_build_script "$src"
     fi
     # Reuse successful builds; no --force and no live module reload.
     local status

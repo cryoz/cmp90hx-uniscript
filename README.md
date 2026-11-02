@@ -340,20 +340,14 @@ Rhonstin файл `driver/VERSION` и отключает необязатель�
 
 ```bash
 bash -n unlock_cmp90hx.sh
-python3 -m unittest test_dkms -v
-python3 -m unittest discover -s tests -v
 ```
 
-Тесты проверяют Bash-синтаксис, соответствие встроенных reference-assets,
-порядок установки, обнаружение userspace, формат версии CUDA и отказ
-при неверной контрольной сумме. Драйверы и systemd-службы тестами не устанавливаются.
+Статус аппаратной проверки DKMS и порядок миграции описаны в
+[DKMS-TEST.md](DKMS-TEST.md).
 
 Минимальный набор для публикации этой ветки: `unlock_cmp90hx.sh`, `README.md`,
 `GEN2-FAST-TEST.md`, `DKMS-TEST.md`, `CREDITS.md` и `LICENSE`.
-`test_dkms.py` содержит отдельные offline-проверки DKMS. Тесты необязательны; если публикуете исходный набор,
-добавьте `tests/` без `__pycache__` и reference-assets `cmp90hx-gen2-fast.sh`,
-`cmp90hx-gen2-fast.service`, `nvidia-pstated-cmp90hx.service`.
 Не включайте `cmp90hx-work`, скачанные установщики, бинарные сборки,
-резервные копии модулей и локальные журналы. Reference-assets нужны тестам;
-конечному пользователю достаточно главного скрипта. Публикуйте [MIT License](LICENSE)
+резервные копии модулей, локальные тесты, reference-assets и журналы.
+Конечному пользователю достаточно главного скрипта. Публикуйте [MIT License](LICENSE)
 вместе с кодом и соблюдайте лицензии upstream и NVIDIA EULA.
