@@ -20,6 +20,8 @@ readonly CUDA_RUNFILE="cuda_13.3.0_610.43.02_linux.run"
 readonly CUDA_URL="https://developer.download.nvidia.com/compute/cuda/13.3.0/local_installers/$CUDA_RUNFILE"
 # Published by NVIDIA: compute/cuda/13.3.0/docs/sidebar/md5sum.txt
 readonly CUDA_MD5="16d68669cf659157777d2e7adaff179d"
+readonly DKMS_NAME="cmp90hx-nvidia"
+readonly DKMS_VERSION="$DRIVER_VERSION-gen2.1"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
@@ -34,6 +36,7 @@ die()  { printf '%b[FAIL]%b %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
 
 ACTION="install"
 INSTALL_USERSPACE=1
+USE_DKMS=0
 ENABLE_SERVICE=1
 ALLOW_UNSUPPORTED=0
 HOST_PROFILE="unknown"
@@ -49,6 +52,7 @@ Usage:
   sudo ./unlock_cmp90hx.sh enable-fast
   sudo ./unlock_cmp90hx.sh enable-full
   sudo ./unlock_cmp90hx.sh install-pstated
+  sudo ./unlock_cmp90hx.sh install-dkms
   ./unlock_cmp90hx.sh verify
 
 Actions:
@@ -59,9 +63,11 @@ Actions:
   enable-fast             Select fast service for NEXT boot (no immediate apply)
   enable-full             Restore full service for NEXT boot
   install-pstated          Build/install clock daemon and its boot service only
+  install-dkms             Migrate installed compute+Gen2 modules to DKMS (experimental)
   verify                  Report driver, compute log markers and PCIe link
 
 Options for install:
+  --dkms                  Build/install modules through DKMS (experimental)
   --install-userspace     Compatibility flag; driver installation is now default
   --no-install-userspace  Require existing NVIDIA 610.43.03 userspace/firmware
   --no-enable-service     Install but disable full/fast Gen2 and clock daemon
@@ -92,7 +98,8 @@ EOF
 
 for arg in "$@"; do
     case "$arg" in
-        install|apply|repair-runtime|verify|install-fast|enable-fast|enable-full|install-pstated) ACTION="$arg" ;;
+        install|apply|repair-runtime|verify|install-fast|enable-fast|enable-full|install-pstated|install-dkms) ACTION="$arg" ;;
+        --dkms) USE_DKMS=1 ;;
         --install-userspace) INSTALL_USERSPACE=1 ;;
         --no-install-userspace) INSTALL_USERSPACE=0 ;;
         --no-enable-service) ENABLE_SERVICE=0 ;;
@@ -321,17 +328,27 @@ select_toolchain() {
     info "Компилятор модулей: $($BUILD_CC --version | head -1); линкер: $BUILD_LD"
 }
 
+patched_module_path() {
+    local path
+    path="$(modinfo -k "$(uname -r)" -n nvidia 2>/dev/null)" || return 1
+    [[ -f "$path" ]] || return 1
+    modinfo -p "$path" | grep -q '^cmp90_gen2_idx:' || return 1
+    printf '%s\n' "$path"
+}
+
 refresh_initramfs() {
     local kver="$(uname -r)" resolved
     depmod -a "$kver"
-    resolved="$(modinfo -n nvidia 2>/dev/null || true)"
-    if [[ "$resolved" != *'/updates/cmpunlocker-90hx-stockflow/nvidia.ko' ]]; then
+    resolved="$(patched_module_path || true)"
+    if [[ -z "$resolved" ]]; then
         die "После depmod выбран неожиданный модуль nvidia: ${resolved:-не найден}"
     fi
 
     if [[ "$HOST_PROFILE" == "debian13" ]]; then
         info "Обновление initramfs Debian для $kver"
         update-initramfs -u -k "$kver"
+    elif ((USE_DKMS)); then
+        mkinitcpio -P
     fi
 }
 
@@ -403,6 +420,18 @@ if old not in text:
     raise SystemExit("consume.sh BAR0 patch point not found")
 path.write_text(text.replace(old, new, 1))
 PY
+    # DKMS can select a distro-specific directory and compress modules.
+    # Use kmod's resolved path in both full and fast copies, not a fixed .ko.
+    python3 - "$RUNTIME_DIR/cmp90hx-gen2-consume.sh" <<'MODULE_PATH'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+t = p.read_text()
+old = 'KO="${CMP90_NVIDIA_KO:-/lib/modules/${KVER}/updates/cmpunlocker-90hx-stockflow/nvidia.ko}"'
+new = 'KO="${CMP90_NVIDIA_KO:-$(modinfo -k "$KVER" -n nvidia)}"\nmodinfo -p "$KO" | grep -q "^cmp90_gen2_idx:" || { echo "Wrong NVIDIA module: $KO" >&2; exit 2; }'
+if t.count(old) != 1:
+    raise SystemExit('consume module-path patch point not found')
+p.write_text(t.replace(old, new))
+MODULE_PATH
     chmod 0755 "$RUNTIME_DIR/cmp90hx-gen2-consume.sh"
 
     # On a minimal/headless installation nothing necessarily opens
@@ -413,7 +442,8 @@ PY
 #!/usr/bin/env bash
 set -euo pipefail
 KVER="$(uname -r)"
-KO="/lib/modules/$KVER/updates/cmpunlocker-90hx-stockflow/nvidia.ko"
+KO="$(modinfo -k "$KVER" -n nvidia)"
+modinfo -p "$KO" | grep -q '^cmp90_gen2_idx:' || { echo "CMP90 prime: wrong NVIDIA module" >&2; exit 2; }
 BDF="$(lspci -Dnn -d 10de:220d | awk 'NR == 1 {print $1}')"
 [[ -n "$BDF" && -f "$KO" ]] || { echo "CMP90 prime: card or module missing" >&2; exit 2; }
 if [[ ! -d /sys/module/nvidia ]]; then
@@ -485,10 +515,13 @@ verify_install() {
     printf 'Boot service: %s\n' "${enabled:-not-installed}"
     printf 'Fast service: %s (experimental)\n' "${fast_enabled:-not-installed}"
 
-    if [[ "$resolved" == *'/updates/cmpunlocker-90hx-stockflow/'* ]]; then
+    if patched_module_path >/dev/null; then
         ok "depmod выбирает объединённый compute+Gen2 модуль"
     else
-        warn "depmod не выбирает модуль из updates/cmpunlocker-90hx-stockflow"
+        warn "depmod не выбирает модуль с параметром GEN2CHAIN cmp90_gen2_idx"
+    fi
+    if command -v dkms >/dev/null; then
+        dkms status -m "$DKMS_NAME" -v "$DKMS_VERSION" || true
     fi
     if [[ "$speed" == "5.0 GT/s PCIe" || "$speed" == "5.0 GT/s" ]]; then
         ok "PCIe Gen2 активен"
@@ -503,12 +536,226 @@ verify_install() {
     fi
 }
 
+dkms_preflight() {
+    command -v dkms >/dev/null || die "Установите dkms: pacman -S dkms или apt install dkms"
+    if [[ "$HOST_PROFILE" == cachyos ]]; then
+        command -v mkinitcpio >/dev/null || die "Для DKMS runtime нужен mkinitcpio"
+    fi
+    # A second DKMS package owning nvidia.ko would race our package on upgrades.
+    local other
+    other="$(dkms status | awk -F/ '/^nvidia[^/]*\// {print $1}' | sort -u)"
+    [[ -z "$other" ]] || die "Зарегистрирован другой NVIDIA DKMS: $other. Сначала разберите конфликт владельцев модулей"
+}
+
+prepare_dkms_scripts() {
+    local gen2="$1"
+    # Reuse pinned upstream preparation and kernel compatibility code without
+    # executing its install/depmod/initramfs/module-unload tail. Fail closed if
+    # upstream changes its boundaries. Generated files retain upstream licensing.
+    python3 - "$gen2/driver" <<'DKMS_SPLIT'
+import pathlib, sys
+driver = pathlib.Path(sys.argv[1])
+t = (driver / 'build-gen2.sh').read_text()
+cut = 'mkdir -p "${INSTALL_MOD_DIR}"\n'
+start = 'fix_kernel_compat() {\n'
+end = '# Generate conftest first\n'
+if t.count(start) != 1 or t.count(end) != 1 or cut not in t:
+    raise SystemExit('Unexpected upstream builder layout; refusing DKMS adaptation')
+prefix = t[:t.index(cut)]
+if not all(s in prefix for s in ('patch -p1', 'PROFILE_PATCH_DIR', 'Memory geometry rewrite skipped')):
+    raise SystemExit('Incomplete upstream source preparation')
+# Preparing source files neither needs root nor kernel headers. The DKMS
+# builder checks target headers when it actually compiles the modules.
+prefix = '\n'.join(line for line in prefix.split('\n')
+                   if not line.startswith(('[[ "${EUID}" -eq 0 ]]', '[[ -d "${KSRC}" ]]')))
+(driver / 'prepare-dkms.sh').write_text(prefix)
+(driver / 'compat-dkms.sh').write_text(t[t.index(start):t.index(end)])
+DKMS_SPLIT
+}
+
+write_dkms_build_script() {
+    local dest="$1"
+    cat >"$dest/cmp90-build.sh" <<'DKMS_BUILD'
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Offline DKMS build only: never download, install, unload or start a service.
+set -Eeuo pipefail
+KVER="${1:?target kernel required}"
+KSRC="${2:?target kernel headers required}"
+JOBS="${3:-2}"
+[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || JOBS=2
+[[ "$KVER" =~ ^6\.(12|18)([.+-]|$) ]] || {
+    echo "Untested kernel $KVER: only 6.12 and 6.18 are allowed in this experimental package" >&2
+    exit 1
+}
+[[ -d "$KSRC" ]] || { echo "Missing headers: $KSRC" >&2; exit 1; }
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+SRC_DIR="$SCRIPT_DIR"
+GSP_C="$SRC_DIR/src/nvidia/src/kernel/gpu/gsp/kernel_gsp.c"
+cd "$SRC_DIR"
+config="$KSRC/.config"
+[[ -r "$config" ]] || config="/boot/config-$KVER"
+[[ -r "$config" ]] || { echo "Missing target kernel config" >&2; exit 1; }
+if grep -qx 'CONFIG_CC_IS_CLANG=y' "$config"; then
+    export CC=clang LD=ld.lld
+    command -v "$CC" >/dev/null; command -v "$LD" >/dev/null
+else
+    version="$(sed -n 's/^CONFIG_GCC_VERSION=//p' "$config")"
+    [[ "$version" =~ ^[0-9]+$ && "$version" -gt 0 ]] || { echo "Missing CONFIG_GCC_VERSION" >&2; exit 1; }
+    major=$((version / 10000))
+    if command -v "gcc-$major" >/dev/null; then
+        export CC="gcc-$major"
+    else
+        [[ "$(gcc -dumpversion | cut -d. -f1)" == "$major" ]] || { echo "Need gcc-$major for $KVER" >&2; exit 1; }
+        export CC=gcc
+    fi
+    if command -v ld.bfd >/dev/null; then export LD=ld.bfd; else export LD=ld; fi
+fi
+export IGNORE_CC_MISMATCH=1
+export NV_EXCLUDE_KERNEL_MODULES="nvidia-drm nvidia-modeset nvidia-peermem"
+info() { echo "[DKMS] $*"; }
+ok() { info "$@"; }
+warn() { info "$@" >&2; }
+source "$SCRIPT_DIR/compat-dkms.sh"
+find . -name '*.sh' -exec chmod +x {} +
+# Same conftest/compatibility passes as the tested Rhonstin build, with
+# target headers passed to EVERY make, including the first conftest pass.
+make -j1 modules SYSSRC="$KSRC" SYSOUT="$KSRC" \
+    KERNEL_UNAME="$KVER" \
+    kernel-open/conftest/headers.h kernel-open/conftest/functions.h \
+    kernel-open/conftest/types.h kernel-open/conftest/generic.h || true
+fix_kernel_compat
+make -j"$JOBS" modules SYSSRC="$KSRC" SYSOUT="$KSRC" KERNEL_UNAME="$KVER" || true
+fix_kernel_compat
+make -j"$JOBS" modules SYSSRC="$KSRC" SYSOUT="$KSRC" KERNEL_UNAME="$KVER"
+for module in nvidia nvidia-uvm; do
+    [[ -s "kernel-open/$module.ko" ]] || { echo "Missing $module.ko" >&2; exit 1; }
+    [[ "$(modinfo -F vermagic "kernel-open/$module.ko")" == "$KVER "* ]] || {
+        echo "Wrong vermagic in $module.ko (expected $KVER)" >&2; exit 1;
+    }
+done
+grep -aq GEN2CHAIN kernel-open/nvidia.ko || { echo "GEN2CHAIN missing" >&2; exit 1; }
+if grep -aq REJOIN16 kernel-open/nvidia.ko; then
+    echo "Incompatible REJOIN16 marker" >&2; exit 1
+fi
+DKMS_BUILD
+    chmod 0755 "$dest/cmp90-build.sh"
+    cat >"$dest/dkms.conf" <<'DKMS_CONF'
+PACKAGE_NAME="cmp90hx-nvidia"
+PACKAGE_VERSION="610.43.03-gen2.1"
+AUTOINSTALL="yes"
+BUILD_EXCLUSIVE_KERNEL="^6\.(12|18)([.+-]|$)"
+MAKE[0]="bash ./cmp90-build.sh '${kernelver}' '${kernel_source_dir}' '${parallel_jobs}'"
+POST_INSTALL="cmp90-post-install.sh ${kernelver}"
+CLEAN="true"
+BUILT_MODULE_NAME[0]="nvidia"
+BUILT_MODULE_NAME[1]="nvidia-uvm"
+BUILT_MODULE_LOCATION[0]="kernel-open"
+BUILT_MODULE_LOCATION[1]="kernel-open"
+DEST_MODULE_LOCATION[0]="/updates/cmpunlocker-90hx-stockflow"
+DEST_MODULE_LOCATION[1]="/updates/cmpunlocker-90hx-stockflow"
+DKMS_CONF
+    cat >"$dest/cmp90-post-install.sh" <<'DKMS_POST'
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+target="${1:?target kernel required}"
+depmod -a "$target"
+# Kernel package hooks create new images; update an existing Debian image
+# as well when DKMS is installed later by the matching headers package.
+if command -v update-initramfs >/dev/null && [[ -f "/boot/initrd.img-$target" ]]; then
+    update-initramfs -u -k "$target"
+fi
+# CachyOS/Arch's DKMS ALPM hook precedes its mkinitcpio hook. The initial
+# migration explicitly calls refresh_initramfs after installing runtime.
+DKMS_POST
+    chmod 0755 "$dest/cmp90-post-install.sh"
+}
+
+install_dkms_modules() {
+    local gen2="$1" src="/usr/src/$DKMS_NAME-$DKMS_VERSION"
+    local registered backup="" old="/lib/modules/$(uname -r)/updates/cmpunlocker-90hx-stockflow"
+    dkms_preflight
+    registered="$(dkms status -m "$DKMS_NAME" -v "$DKMS_VERSION")"
+    if [[ -z "$registered" ]]; then
+        [[ ! -e "$src" ]] || die "Незарегистрированный $src уже существует; не перезаписываю"
+        prepare_dkms_scripts "$gen2"
+        env CMPUNLOCKER_CARD_PROFILE=cmp90-rejoin15 \
+            CMPUNLOCKER_DRIVER_VERSION="$DRIVER_VERSION" \
+            CMPUNLOCKER_BUILD_DIR="$gen2/driver/.build" \
+            bash "$gen2/driver/prepare-dkms.sh"
+        local prepared="$gen2/driver/.build/open-gpu-kernel-modules-$DRIVER_VERSION"
+        [[ -d "$prepared/kernel-open" ]] || die "Нет подготовленных исходников: $prepared"
+        cp "$gen2/driver/compat-dkms.sh" "$prepared/"
+        cp "$gen2/driver/inject_rpc_tracer.py" "$prepared/"
+        if [[ -f "$gen2/LICENSE" ]]; then cp "$gen2/LICENSE" "$prepared/RHONSTIN-LICENSE"; fi
+        write_dkms_build_script "$prepared"
+        printf '%s\n' "$GEN2_REF" >"$prepared/cmp90-upstream-ref"
+        cp -a "$prepared" "$src"
+        dkms add -m "$DKMS_NAME" -v "$DKMS_VERSION"
+    else
+        [[ "$(cat "$src/cmp90-upstream-ref" 2>/dev/null)" == "$GEN2_REF" ]] ||
+            die "Зарегистрированный DKMS использует другой upstream; не подменяю исходники существующей версии"
+        # Refresh our wrapper when retrying a failed migration. NVIDIA sources
+        # and upstream compatibility code stay pinned and are not downloaded.
+        write_dkms_build_script "$src"
+    fi
+    # Reuse successful builds; no --force and no live module reload.
+    local status
+    status="$(dkms status -m "$DKMS_NAME" -v "$DKMS_VERSION" -k "$(uname -r)")"
+    if [[ "$status" != *': installed'* ]]; then
+        if [[ "$status" != *': built'* ]]; then
+            dkms build -m "$DKMS_NAME" -v "$DKMS_VERSION" -k "$(uname -r)"
+        fi
+        # Migrate manual copies only after a successful build. They otherwise
+        # shadow /updates/dkms on Debian and retain the pre-DKMS binaries.
+        if [[ -d "$old" ]]; then
+            backup="$STATE_DIR/backups/$(uname -r)-pre-dkms-$(date +%Y%m%d-%H%M%S)"
+            mkdir -p "$(dirname "$backup")"
+            mv "$old" "$backup"
+            warn "Прежние ручные модули сохранены: $backup"
+        fi
+        if ! dkms install -m "$DKMS_NAME" -v "$DKMS_VERSION" -k "$(uname -r)"; then
+            if [[ -n "$backup" && ! -e "$old" ]]; then mv "$backup" "$old"; fi
+            depmod -a "$(uname -r)"
+            die "DKMS install не завершён; см. dkms status и make.log. Загруженный модуль не менялся"
+        fi
+    fi
+    backup_compute_only_modules
+    depmod -a "$(uname -r)"
+    patched_module_path >/dev/null || die "После DKMS выбран другой NVIDIA-модуль; проверьте modinfo -n nvidia"
+    ok "DKMS $DKMS_NAME/$DKMS_VERSION установлен для $(uname -r); текущий GPU не перезагружался"
+}
+
+do_install_dkms() {
+    require_root
+    require_commands
+    host_preflight
+    detect_cards
+    ensure_no_unlock_in_progress
+    dkms_preflight
+    [[ -f "$SERVICE_FILE" ]] || die "Для миграции нужен установленный runtime; для новой установки: install --dkms"
+    local gen2="$STATE_DIR/src/gen2-$GEN2_REF"
+    [[ -f "$gen2/driver/build-gen2.sh" ]] || die "Нет сохранённых исходников $gen2; нужен прежний CMP90_STATE_DIR"
+    USE_DKMS=1
+    install_dkms_modules "$gen2"
+    install_runtime "$gen2"
+    install_fast_runtime
+    refresh_initramfs
+    ok "Миграция на DKMS завершена. После холодного включения выполните verify"
+}
+
 do_install() {
     local gen2="$STATE_DIR/src/gen2-$GEN2_REF"
     local final_ko
     require_root
     require_commands
     host_preflight
+    if command -v dkms >/dev/null && [[ -n "$(dkms status -m "$DKMS_NAME" -v "$DKMS_VERSION")" ]]; then
+        USE_DKMS=1
+        info "Сохранён зарегистрированный DKMS-режим"
+    fi
+    if ((USE_DKMS)); then dkms_preflight; fi
     detect_cards
     ensure_no_unlock_in_progress
     pstated_preflight
@@ -531,25 +778,24 @@ do_install() {
     # Ensure the directly invoked build entry point is executable, including
     # copies with lost permission bits, before moving working modules.
     chmod +x "$gen2/driver/build-gen2.sh"
-    backup_compute_only_modules
-    if ! env CC="$BUILD_CC" LD="$BUILD_LD" IGNORE_CC_MISMATCH=1 \
-        CMPUNLOCKER_DRIVER_VERSION="$DRIVER_VERSION" \
-        CMPUNLOCKER_CARD_PROFILE=cmp90-rejoin15 \
-        "$gen2/driver/build-gen2.sh"; then
-        if [[ -n "${MOVED_OLD_MODULES:-}" && ! -e "/lib/modules/$(uname -r)/updates/cmpunlocker" ]]; then
-            mv "$MOVED_OLD_MODULES" "/lib/modules/$(uname -r)/updates/cmpunlocker"
-            depmod -a "$(uname -r)"
-            warn "После ошибки восстановлены прежние compute-only модули"
+    if ((USE_DKMS)); then
+        install_dkms_modules "$gen2"
+    else
+        backup_compute_only_modules
+        if ! env CC="$BUILD_CC" LD="$BUILD_LD" IGNORE_CC_MISMATCH=1 \
+            CMPUNLOCKER_DRIVER_VERSION="$DRIVER_VERSION" \
+            CMPUNLOCKER_CARD_PROFILE=cmp90-rejoin15 \
+            "$gen2/driver/build-gen2.sh"; then
+            if [[ -n "${MOVED_OLD_MODULES:-}" && ! -e "/lib/modules/$(uname -r)/updates/cmpunlocker" ]]; then
+                mv "$MOVED_OLD_MODULES" "/lib/modules/$(uname -r)/updates/cmpunlocker"
+                depmod -a "$(uname -r)"
+                warn "После ошибки восстановлены прежние compute-only модули"
+            fi
+            die "Сборка объединённого модуля завершилась ошибкой"
         fi
-        die "Сборка объединённого модуля завершилась ошибкой"
     fi
 
-    final_ko="/lib/modules/$(uname -r)/updates/cmpunlocker-90hx-stockflow/nvidia.ko"
-    [[ -f "$final_ko" ]] || die "Сборщик не установил $final_ko"
-    grep -aq 'GEN2CHAIN' "$final_ko" || die "В nvidia.ko нет маркера GEN2CHAIN (патч 0017 не применён)"
-    if grep -aq 'REJOIN16' "$final_ko"; then
-        die "В nvidia.ko остался REJOIN16: патч 0017 не заменил несовместимый write-spec путь"
-    fi
+    final_ko="$(patched_module_path)" || die "Сборщик не установил/не выбрал GEN2CHAIN-модуль"
     install_runtime "$gen2"
     install_fast_runtime
     refresh_initramfs
@@ -577,7 +823,7 @@ repair_runtime() {
     ensure_no_unlock_in_progress
     [[ -d "$gen2/.git" ]] ||
         die "Не найдено рабочее дерево $gen2. Выполните полный install"
-    [[ -f "/lib/modules/$(uname -r)/updates/cmpunlocker-90hx-stockflow/nvidia.ko" ]] ||
+    patched_module_path >/dev/null ||
         die "Объединённый nvidia.ko не установлен; выполните полный install"
     install_runtime "$gen2"
     install_fast_runtime
@@ -588,8 +834,7 @@ install_fast_runtime() {
     require_root
     ensure_no_unlock_in_progress
     detect_cards
-    local ko="/lib/modules/$(uname -r)/updates/cmpunlocker-90hx-stockflow/nvidia.ko"
-    [[ -f "$ko" ]] && grep -aq GEN2CHAIN "$ko" || die "Нужен установленный GEN2CHAIN-модуль"
+    patched_module_path >/dev/null || die "Нужен установленный GEN2CHAIN-модуль"
     command -v flock >/dev/null || die "Нужен flock (пакет util-linux)"
     [[ -x "$RUNTIME_DIR/cmp90hx-gen2-consume.sh" ]] || die "Сначала выполните install или repair-runtime"
     # Change only the loop order in a separate copy. Preserve the proven
@@ -837,6 +1082,7 @@ select_boot_mode() {
 
 case "$ACTION" in
     install) do_install ;;
+    install-dkms) do_install_dkms ;;
     apply)
         require_root
         ensure_no_unlock_in_progress
