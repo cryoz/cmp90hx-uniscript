@@ -7,6 +7,9 @@
 
 ## Используемые проекты
 
+- [dkms-project/dkms](https://github.com/dkms-project/dkms) — регистрация,
+  сборка и установка патченных модулей под новые ядра в экспериментальном
+  режиме `install-dkms` / `install --dkms`.
 - [Rhonstin/CMP-90HX-Compute-PCIE2.0-unlock](https://github.com/Rhonstin/CMP-90HX-Compute-PCIE2.0-unlock)
   — объединённые патчи compute + PCIe Gen2, `driver/build-gen2.sh`, исходные
   consume/hammer-скрипты. Установщик использует commit
@@ -58,6 +61,10 @@
 и CUDA, runtime-адаптация BAR0/SS, experimental fast-проход с полным fallback,
 systemd-службы и настройка `nvidia-pstated` для одной карты.
 Авторство underlying патчей и демона остаётся за соответствующими проектами.
+
+DKMS-адаптация использует подготовку исходников и compatibility-функцию
+закреплённого сборщика Rhonstin. Эти извлечённые части сохраняют upstream
+лицензирование; собственная обвязка установщика не меняет лицензии зависимостей.
 
 ## Лицензии
 
